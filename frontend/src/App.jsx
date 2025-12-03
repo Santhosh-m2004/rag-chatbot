@@ -1,10 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
+import config from './config'
 
-// Set axios base URL
-axios.defaults.baseURL = 'http://localhost:5000/api';
+
+axios.defaults.baseURL = config.apiBaseUrl;
 axios.defaults.headers.post['Content-Type'] = 'application/json';
+axios.defaults.headers.common['Accept'] = 'application/json';
+axios.defaults.withCredentials = false; // Important for Render
+axios.defaults.timeout = 10000; // 10 second timeout for mobile
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
