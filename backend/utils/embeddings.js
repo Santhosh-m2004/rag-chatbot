@@ -1,99 +1,120 @@
-// Text chunking utility with sentence-aware chunking
-export function chunkText(text, chunkSize = 800, overlap = 150) {
-  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+// Text chunking utility
+export function chunkText(text, chunkSize = 1000, overlap = 200) {
+  if (!text || text.trim().length === 0) {
+    return [];
+  }
+  
   const chunks = [];
-  let currentChunk = '';
+  let startIndex = 0;
   
-  for (const sentence of sentences) {
-    if ((currentChunk.length + sentence.length) <= chunkSize) {
-      currentChunk += sentence;
-    } else {
-      if (currentChunk.trim().length > 0) {
-        chunks.push(currentChunk.trim());
-      }
-      currentChunk = sentence;
+  while (startIndex < text.length) {
+    const endIndex = Math.min(startIndex + chunkSize, text.length);
+    const chunk = text.slice(startIndex, endIndex).trim();
+    
+    if (chunk.length > 0) {
+      chunks.push(chunk);
     }
+    
+    startIndex += chunkSize - overlap;
+    
+    // Safety break
+    if (chunks.length > 100) break;
   }
   
-  // Add the last chunk
-  if (currentChunk.trim().length > 0) {
-    chunks.push(currentChunk.trim());
-  }
-  
-  // Create overlapping chunks if needed
-  const overlappingChunks = [];
-  for (let i = 0; i < chunks.length; i++) {
-    if (i > 0) {
-      const prevChunk = chunks[i - 1];
-      const current = chunks[i];
-      const overlapText = prevChunk.slice(-overlap) + ' ' + current;
-      overlappingChunks.push(overlapText.trim());
-    }
-    overlappingChunks.push(chunks[i]);
-  }
-  
-  return overlappingChunks.slice(0, 50); // Limit to 50 chunks max
+  return chunks;
 }
 
 // Generate embeddings for text chunks
 export async function generateEmbeddings(chunks) {
-  const chunksWithEmbeddings = chunks.map(text => {
-    const embedding = createEnhancedEmbedding(text);
-    return { text, embedding };
+  console.log(`Generating embeddings for ${chunks.length} chunks...`);
+  
+  const chunksWithEmbeddings = chunks.map((text, index) => {
+    try {
+      const embedding = createSimpleEmbedding(text);
+      
+      // Validate embedding
+      if (!embedding || embedding.length === 0) {
+        console.error(`Embedding generation failed for chunk ${index}`);
+        return { text, embedding: new Array(128).fill(0) };
+      }
+      
+      return { text, embedding };
+    } catch (error) {
+      console.error(`Error generating embedding for chunk ${index}:`, error);
+      return { text, embedding: new Array(128).fill(0) };
+    }
   });
+  
+  console.log(`Generated ${chunksWithEmbeddings.length} embeddings`);
+  
+  // Verify at least one embedding is valid
+  const validEmbeddings = chunksWithEmbeddings.filter(c => 
+    c.embedding && c.embedding.length > 0 && c.embedding.some(v => v !== 0)
+  );
+  
+  console.log(`Valid embeddings: ${validEmbeddings.length}/${chunksWithEmbeddings.length}`);
   
   return chunksWithEmbeddings;
 }
 
-// Create enhanced embedding with better semantic representation
-export function createSimpleEmbedding(text, dimensions = 256) {
-  // Clean and normalize text
+// Create a simple embedding
+export function createSimpleEmbedding(text, dimensions = 128) {
+  if (!text || typeof text !== 'string') {
+    console.error('Invalid text for embedding:', text);
+    return new Array(dimensions).fill(0);
+  }
+  
   const cleanText = text.toLowerCase()
-    .replace(/[^\w\s]/g, ' ')  // Replace punctuation with spaces
-    .replace(/\s+/g, ' ')      // Normalize whitespace
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
+  
+  if (cleanText.length === 0) {
+    return new Array(dimensions).fill(0);
+  }
   
   const words = cleanText.split(' ');
   const embedding = new Array(dimensions).fill(0);
   
-  // Enhanced hashing with word frequency and position
+  // Simple but consistent hashing
   words.forEach((word, wordIndex) => {
     if (word.length < 2) return;
     
     let hash = 0;
     for (let i = 0; i < word.length; i++) {
       hash = ((hash << 5) - hash) + word.charCodeAt(i);
-      hash = hash & hash;
+      hash = hash & hash; // Convert to 32-bit integer
     }
     
-    // Use multiple indices based on word and position
-    const index1 = Math.abs(hash) % dimensions;
-    const index2 = Math.abs(hash * 31) % dimensions;
-    const index3 = (Math.abs(hash) + wordIndex) % dimensions;
+    // Use word position to influence the hash
+    const positionFactor = (wordIndex % 3) + 1;
+    const finalHash = Math.abs(hash * positionFactor);
     
-    // Add weighted values
-    const weight = 1 / (wordIndex + 1); // Earlier words get more weight
-    embedding[index1] += weight;
-    embedding[index2] += weight * 0.7;
-    embedding[index3] += weight * 0.5;
+    // Distribute across multiple indices
+    for (let j = 0; j < 3; j++) {
+      const index = (finalHash + j * 31) % dimensions;
+      embedding[index] += 1 / (j + 1);
+    }
   });
   
-  // Normalize the embedding
+  // Normalize
   const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
   if (magnitude > 0) {
     return embedding.map(val => val / magnitude);
   }
+  
   return embedding;
-}
-
-// Enhanced embedding for better semantic matching
-function createEnhancedEmbedding(text, dimensions = 256) {
-  return createSimpleEmbedding(text, dimensions);
 }
 
 // Calculate cosine similarity
 export function cosineSimilarity(vecA, vecB) {
-  if (!vecA || !vecB || vecA.length !== vecB.length) {
+  if (!vecA || !vecB || !Array.isArray(vecA) || !Array.isArray(vecB)) {
+    console.error('Invalid vectors for cosine similarity:', { vecA, vecB });
+    return 0;
+  }
+  
+  if (vecA.length !== vecB.length) {
+    console.error(`Vector length mismatch: ${vecA.length} vs ${vecB.length}`);
     return 0;
   }
   
@@ -112,24 +133,10 @@ export function cosineSimilarity(vecA, vecB) {
   magA = Math.sqrt(magA);
   magB = Math.sqrt(magB);
   
-  if (magA === 0 || magB === 0) return 0;
+  if (magA === 0 || magB === 0) {
+    return 0;
+  }
   
   const similarity = dotProduct / (magA * magB);
-  return Math.max(0, Math.min(1, similarity)); // Clamp between 0 and 1
-}
-
-// Find relevant chunks with similarity threshold
-export function findRelevantChunks(queryEmbedding, chunks, topK = 5, threshold = 0.1) {
-  if (!chunks || chunks.length === 0) return [];
-  
-  const scored = chunks.map(chunk => ({
-    ...chunk,
-    score: cosineSimilarity(queryEmbedding, chunk.embedding || [])
-  }));
-  
-  scored.sort((a, b) => b.score - a.score);
-  
-  return scored
-    .filter(chunk => chunk.score > threshold)
-    .slice(0, topK);
+  return Math.max(-1, Math.min(1, similarity)); // Clamp to [-1, 1]
 }
