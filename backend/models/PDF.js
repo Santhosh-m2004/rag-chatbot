@@ -14,7 +14,12 @@ const pdfSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  filePath: {
+  cloudinaryId: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  cloudinaryUrl: {
     type: String,
     required: true
   },
@@ -36,7 +41,7 @@ const pdfSchema = new mongoose.Schema({
   }
 });
 
-// Index for faster queries
+// Only create indexes once - remove duplicate index definitions
 pdfSchema.index({ userId: 1, uploadedAt: -1 });
 
 export default mongoose.model('PDF', pdfSchema);
