@@ -1,12 +1,56 @@
 import express from 'express';
 import { authMiddleware } from '../middleware/auth.js';
 import PDF from '../models/PDF.js';
+import ChatHistory from '../models/ChatHistory.js';
 import { generateResponse } from '../utils/groq.js';
 import { createSimpleEmbedding, cosineSimilarity } from '../utils/embeddings.js';
 
 const router = express.Router();
 
-// Chat with PDF (RAG implementation)
+// Helper function to detect if it's just a simple greeting
+function isSimpleGreeting(message) {
+  const simpleGreetings = [
+    'hi', 'hello', 'hey', 'greetings', 
+    'good morning', 'good afternoon', 'good evening',
+    'hi there', 'hello there'
+  ];
+  
+  const cleanedMessage = message.toLowerCase().trim();
+  
+  // Check exact matches
+  if (simpleGreetings.includes(cleanedMessage)) {
+    return true;
+  }
+  
+  // Check with punctuation
+  const greetingsWithPunctuation = simpleGreetings.map(g => `${g}.`).concat(simpleGreetings.map(g => `${g}!`));
+  if (greetingsWithPunctuation.includes(cleanedMessage)) {
+    return true;
+  }
+  
+  // Check if it's just "hi" or "hello" with minor variations
+  const words = cleanedMessage.split(/\s+/);
+  if (words.length === 1 && (words[0].startsWith('hi') || words[0].startsWith('hello') || words[0].startsWith('hey'))) {
+    return true;
+  }
+  
+  return false;
+}
+
+// Helper function to detect if it's asking about the PDF
+function isAskingAboutPDF(message) {
+  const pdfKeywords = [
+    'pdf', 'document', 'file', 'about', 'tell me', 'describe', 
+    'summarize', 'what is', 'overview', 'what\'s this', 'whats this',
+    'explain this', 'explain the'
+  ];
+  
+  const cleanedMessage = message.toLowerCase().trim();
+  
+  return pdfKeywords.some(keyword => cleanedMessage.includes(keyword));
+}
+
+// Chat with PDF (RAG implementation with history)
 router.post('/', authMiddleware, async (req, res) => {
   try {
     const { message, pdfId } = req.body;
@@ -32,37 +76,148 @@ router.post('/', authMiddleware, async (req, res) => {
       });
     }
 
-    // Find the specific PDF for this user
+    // Find or create chat history
+    let chatHistory = await ChatHistory.findOne({
+      userId: userId,
+      pdfId: pdfId
+    });
+
+    if (!chatHistory) {
+      // Get PDF info for title
+      const pdf = await PDF.findOne({ _id: pdfId, userId: userId }).select('filename');
+      const title = pdf ? `Chat about ${pdf.filename}` : 'Chat Session';
+      
+      chatHistory = new ChatHistory({
+        userId: userId,
+        pdfId: pdfId,
+        title: title,
+        messages: []
+      });
+      await chatHistory.save();
+      console.log('✅ Created new chat history');
+    }
+
+    console.log(`📝 Chat History ID: ${chatHistory._id}`);
+    console.log(`Previous messages: ${chatHistory.messages.length}`);
+
+    // Find the PDF
     const pdf = await PDF.findOne({ 
       _id: pdfId, 
       userId: userId 
-    }).lean(); // Use lean() for better performance
+    }).lean();
 
     if (!pdf) {
       console.log('❌ PDF not found for user');
       const directResponse = await generateResponse(message);
+      
+      // Save user message anyway
+      chatHistory.messages.push({
+        role: 'user',
+        content: message
+      });
+      chatHistory.messages.push({
+        role: 'assistant',
+        content: directResponse,
+        source: 'direct_ai_pdf_not_found'
+      });
+      await chatHistory.save();
+      
       return res.json({
         response: directResponse,
         source: 'direct_ai_pdf_not_found',
-        relevantChunks: []
+        relevantChunks: [],
+        chatHistoryId: chatHistory._id
       });
     }
 
     console.log(`✅ PDF found: ${pdf.filename}`);
     console.log(`PDF ID: ${pdf._id}`);
-    console.log(`Text length: ${pdf.textContent?.length || 0} chars`);
-    console.log(`Chunks count: ${pdf.chunks?.length || 0}`);
+
+    // Save user message to history
+    chatHistory.messages.push({
+      role: 'user',
+      content: message
+    });
+
+    // Check if it's just a simple greeting
+    if (isSimpleGreeting(message)) {
+      console.log('✅ Detected simple greeting - responding casually');
+      
+      // Get last 2 messages for context
+      const lastMessages = chatHistory.messages.slice(-3, -1); // Exclude current message
+      const hasPreviousConversation = lastMessages.length > 0;
+      
+      let greetingPrompt;
+      
+      if (hasPreviousConversation) {
+        // Continue existing conversation
+        greetingPrompt = `Continue the conversation naturally. 
+        
+        Previous messages:
+        ${lastMessages.map(msg => `${msg.role}: ${msg.content}`).join('\n')}
+        
+        User just said: "${message}"
+        
+        Respond with a simple, friendly greeting to continue the conversation naturally. 
+        Keep it casual and short (1-2 sentences max).`;
+      } else {
+        // Start new conversation
+        greetingPrompt = `Start a new conversation about a PDF document.
+        
+        PDF filename: "${pdf.filename}"
+        User said: "${message}"
+        
+        Respond with a simple, friendly greeting. Examples:
+        - "Hi! 👋"
+        - "Hello! How can I help you today?"
+        - "Hey there!"
+        - "Hi! Ready when you are."
+        
+        DO NOT mention or describe the PDF content. Just greet naturally.`;
+      }
+      
+      const response = await generateResponse(greetingPrompt);
+      
+      // Save assistant response
+      chatHistory.messages.push({
+        role: 'assistant',
+        content: response,
+        source: 'greeting'
+      });
+      await chatHistory.save();
+      
+      console.log(`💾 Saved greeting response. Total messages: ${chatHistory.messages.length}`);
+      
+      return res.json({
+        response,
+        source: 'greeting',
+        relevantChunks: [],
+        chatHistoryId: chatHistory._id
+      });
+    }
 
     // Check if PDF has chunks
     if (!pdf.chunks || pdf.chunks.length === 0) {
       console.log('❌ PDF has no chunks - using direct AI');
       const directResponse = await generateResponse(message);
+      
+      chatHistory.messages.push({
+        role: 'assistant',
+        content: directResponse,
+        source: 'direct_ai_no_chunks'
+      });
+      await chatHistory.save();
+      
       return res.json({
         response: directResponse,
         source: 'direct_ai_no_chunks',
-        relevantChunks: []
+        relevantChunks: [],
+        chatHistoryId: chatHistory._id
       });
     }
+
+    console.log(`Text length: ${pdf.textContent?.length || 0} chars`);
+    console.log(`Chunks count: ${pdf.chunks?.length || 0}`);
 
     // Create query embedding
     const queryEmbedding = createSimpleEmbedding(message);
@@ -75,7 +230,6 @@ router.post('/', authMiddleware, async (req, res) => {
     for (let i = 0; i < pdf.chunks.length; i++) {
       const chunk = pdf.chunks[i];
       if (!chunk.embedding || chunk.embedding.length === 0) {
-        console.log(`Chunk ${i} has no embedding`);
         continue;
       }
       
@@ -93,20 +247,22 @@ router.post('/', authMiddleware, async (req, res) => {
     // Sort by relevance
     chunksWithScores.sort((a, b) => b.score - a.score);
 
-    // Log top similarities
-    console.log('\nTop 5 similarities:');
-    chunksWithScores.slice(0, 5).forEach((chunk, i) => {
-      console.log(`${i + 1}. Score: ${chunk.score.toFixed(4)} - ${chunk.text.substring(0, 100)}...`);
-    });
+    // Log top 3 similarities for debugging
+    if (chunksWithScores.length > 0) {
+      console.log('Top 3 similarities:');
+      chunksWithScores.slice(0, 3).forEach((chunk, i) => {
+        console.log(`${i + 1}. Score: ${chunk.score.toFixed(4)} - ${chunk.text.substring(0, 100)}...`);
+      });
+    }
 
-    // Get relevant chunks - use VERY LOW threshold to ensure we get something
+    // Get relevant chunks
     const relevantChunks = chunksWithScores
-      .filter(chunk => chunk.score > 0.01) // Extremely low threshold
+      .filter(chunk => chunk.score > 0.01)
       .slice(0, 5);
 
     console.log(`Found ${relevantChunks.length} relevant chunks (score > 0.01)`);
 
-    // If no relevant chunks found, force use top 3 chunks anyway
+    // If no relevant chunks found, use top 3 chunks anyway
     let finalChunks = relevantChunks;
     if (finalChunks.length === 0 && chunksWithScores.length > 0) {
       console.log('⚠️ No chunks above threshold, using top 3 chunks anyway');
@@ -116,10 +272,19 @@ router.post('/', authMiddleware, async (req, res) => {
     if (finalChunks.length === 0) {
       console.log('❌ No chunks available at all - using direct AI');
       const directResponse = await generateResponse(message);
+      
+      chatHistory.messages.push({
+        role: 'assistant',
+        content: directResponse,
+        source: 'direct_ai_no_relevant_chunks'
+      });
+      await chatHistory.save();
+      
       return res.json({
         response: directResponse,
         source: 'direct_ai_no_relevant_chunks',
-        relevantChunks: []
+        relevantChunks: [],
+        chatHistoryId: chatHistory._id
       });
     }
 
@@ -127,146 +292,71 @@ router.post('/', authMiddleware, async (req, res) => {
     const context = finalChunks.map(chunk => chunk.text).join('\n\n');
     console.log(`Context created: ${context.length} characters`);
 
-    // Create STRICT RAG prompt
-    // In chat.js, replace the prompt creation logic with this:
+    // Get conversation context (last 4 messages for continuity)
+    const lastMessages = chatHistory.messages.slice(-4);
+    const conversationContext = lastMessages.length > 0 
+      ? lastMessages.map(msg => `${msg.role}: ${msg.content}`).join('\n')
+      : 'No previous conversation';
 
-// Analyze question type and create targeted prompt
-let ragPrompt;
-const question = message.toLowerCase().trim();
+    // Create smart RAG prompt
+    let ragPrompt;
+    
+    if (isAskingAboutPDF(message)) {
+      // User is asking about the PDF specifically
+      ragPrompt = `You are helping a user understand a PDF document.
+      
+      PDF FILENAME: "${pdf.filename}"
+      
+      DOCUMENT CONTENT (relevant parts):
+      ${context}
+      
+      USER'S QUESTION: "${message}"
+      
+      Please provide a helpful response about the document. If you can't find specific information, 
+      say what you can based on the available content.`;
+      
+      console.log('Detected: PDF-specific question');
+    } else {
+      // General question that should use PDF content
+      ragPrompt = `You are having a conversation about a PDF document with a user.
+      
+      PREVIOUS CONVERSATION (for context):
+      ${conversationContext}
+      
+      PDF FILENAME: "${pdf.filename}"
+      
+      RELEVANT DOCUMENT CONTEXT:
+      ${context}
+      
+      USER'S CURRENT QUESTION: "${message}"
+      
+      Please answer based on the document content above. Continue the conversation naturally.`;
+      
+      console.log('Detected: General question using PDF content');
+    }
 
-console.log(`Analyzing question: "${message}"`);
-
-// Common question patterns
-const isGreeting = /^(hi|hello|hey|greetings)/.test(question);
-const isSummaryRequest = /\b(summar|overview|about|tell me about|what is this|describe)\b/.test(question);
-const isSpecificQuestion = /\b(tech stack|technology|framework|library|tool|language|skill|how.*built|what.*use(d)?)\b/.test(question);
-const isListQuestion = /\b(list|name|what are|which|mention)\b/.test(question);
-const isPersonQuestion = /\b(who|person|student|author|supervisor|professor)\b/.test(question);
-const isDetailQuestion = /\b(detail|explain|elaborate|how.*work|process|methodology)\b/.test(question);
-
-if (isGreeting) {
-  ragPrompt = `You are analyzing this document. Provide a helpful greeting and brief introduction:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  Respond with a friendly greeting and a 1-2 sentence overview of what this document is about.`;
-  
-  console.log('Detected: Greeting question');
-  
-} else if (isSummaryRequest) {
-  ragPrompt = `Provide a concise summary of this document:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  Create a structured summary with:
-  1. Document type and purpose
-  2. Main topics/themes
-  3. Key findings or conclusions
-  4. Any notable details
-  
-  Keep it informative but not too verbose.`;
-  
-  console.log('Detected: Summary request');
-  
-} else if (isSpecificQuestion) {
-  // Extract specific information from context
-  const techKeywords = ['tech stack', 'technology', 'framework', 'library', 'tool', 
-                       'language', 'software', 'platform', 'system', 'architecture'];
-  
-  ragPrompt = `Extract SPECIFIC technical information from this document:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  QUESTION: ${message}
-  
-  Focus on extracting concrete technical details mentioned in the document such as:
-  - Programming languages (Java, Python, JavaScript, etc.)
-  - Frameworks and libraries (React, Node.js, Express, etc.)
-  - Databases (MongoDB, MySQL, etc.)
-  - Tools and platforms (Git, Docker, Blockchain, IPFS, etc.)
-  - Technologies mentioned specifically
-  
-  If the document mentions specific technologies, list them clearly.
-  If not explicitly mentioned, say what technical information IS available.`;
-  
-  console.log('Detected: Technical/specific question');
-  
-} else if (isListQuestion) {
-  ragPrompt = `List specific items or information from the document:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  QUESTION: ${message}
-  
-  Extract and list specific items mentioned in the document.
-  Format as bullet points if appropriate.`;
-  
-  console.log('Detected: List question');
-  
-} else if (isPersonQuestion) {
-  ragPrompt = `Extract information about people mentioned:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  QUESTION: ${message}
-  
-  Find and list:
-  - Authors/creators
-  - Team members
-  - Supervisors/mentors
-  - Any other individuals mentioned
-  
-  Include their roles or affiliations if mentioned.`;
-  
-  console.log('Detected: Person-related question');
-  
-} else if (isDetailQuestion) {
-  ragPrompt = `Provide detailed explanation based on document:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  QUESTION: ${message}
-  
-  Give a detailed, explanatory response based strictly on the document content.
-  Include specific examples or processes mentioned in the document.`;
-  
-  console.log('Detected: Detailed explanation request');
-  
-} else {
-  // General question - be more directive
-  ragPrompt = `Answer this question by extracting SPECIFIC information from the document:
-  
-  DOCUMENT CONTENT:
-  ${context}
-  
-  QUESTION: ${message}
-  
-  Your response must:
-  1. Be based ONLY on information found in the document above
-  2. Extract and present specific facts, names, numbers, or details mentioned
-  3. If exact answer isn't found, present the closest relevant information
-  4. Quote or reference specific parts when possible
-  5. Avoid generalizations - be specific and concrete
-  
-  Focus on WHAT IS ACTUALLY IN THE DOCUMENT, not general knowledge.`;
-  
-  console.log('Detected: General question');
-}
-
-    console.log('\nSending to Groq with RAG context...');
+    console.log('\nSending to Groq with context...');
     console.log(`Prompt length: ${ragPrompt.length} chars`);
     
     // Generate response using Groq
     const response = await generateResponse(ragPrompt);
 
     console.log('✅ Response generated successfully');
-    console.log(`Response: ${response.substring(0, 200)}...`);
+    console.log(`Response preview: ${response.substring(0, 200)}...`);
+
+    // Save assistant response to history
+    chatHistory.messages.push({
+      role: 'assistant',
+      content: response,
+      source: 'pdf_content',
+      metadata: {
+        relevantChunks: finalChunks.length,
+        topScore: finalChunks[0]?.score || 0
+      }
+    });
+    
+    await chatHistory.save();
+    console.log(`💾 Saved to chat history. Total messages: ${chatHistory.messages.length}`);
 
     res.json({
       response,
@@ -276,14 +366,14 @@ if (isGreeting) {
         text: chunk.text.substring(0, 150) + '...',
         score: chunk.score
       })),
+      chatHistoryId: chatHistory._id,
       debug: {
         pdfId: pdf._id,
         pdfName: pdf.filename,
         totalChunks: pdf.chunks.length,
-        chunksWithEmbeddings: chunksWithScores.length,
         relevantChunksUsed: finalChunks.length,
         topScore: finalChunks[0]?.score || 0,
-        contextLength: context.length
+        conversationMessages: chatHistory.messages.length
       }
     });
 
@@ -293,42 +383,36 @@ if (isGreeting) {
     console.error('❌ Chat error:', error);
     console.error('Error stack:', error.stack);
     
-    // Try direct response as last resort
-    try {
-      console.log('Attempting direct response as fallback...');
-      const directResponse = await generateResponse(req.body.message);
-      return res.json({
-        response: directResponse,
-        source: 'direct_fallback_after_error',
-        relevantChunks: [],
-        error: error.message
-      });
-    } catch (fallbackError) {
-      console.error('Fallback also failed:', fallbackError);
-      res.status(500).json({ 
-        error: 'Failed to process request',
-        details: error.message
-      });
-    }
+    res.status(500).json({ 
+      error: 'Failed to process request',
+      details: error.message
+    });
   }
 });
 
 // Get chat history for a PDF
 router.get('/history/:pdfId', authMiddleware, async (req, res) => {
   try {
-    const pdf = await PDF.findOne({
-      _id: req.params.pdfId,
+    const chatHistory = await ChatHistory.findOne({
+      pdfId: req.params.pdfId,
       userId: req.userId
-    }).select('_id filename');
+    }).sort({ lastActive: -1 });
 
-    if (!pdf) {
-      return res.status(404).json({ error: 'PDF not found' });
+    if (!chatHistory) {
+      return res.json({
+        pdfId: req.params.pdfId,
+        messages: [],
+        title: 'New Chat'
+      });
     }
 
     res.json({
-      pdfId: pdf._id,
-      pdfName: pdf.filename,
-      messages: []
+      chatHistoryId: chatHistory._id,
+      pdfId: chatHistory.pdfId,
+      title: chatHistory.title,
+      messages: chatHistory.messages,
+      lastActive: chatHistory.lastActive,
+      createdAt: chatHistory.createdAt
     });
   } catch (error) {
     console.error('History error:', error);
@@ -336,31 +420,68 @@ router.get('/history/:pdfId', authMiddleware, async (req, res) => {
   }
 });
 
-// Debug endpoint: Get PDF details
-router.get('/debug/pdf/:pdfId', authMiddleware, async (req, res) => {
+// Get all chat histories for user
+router.get('/histories', authMiddleware, async (req, res) => {
   try {
-    const pdf = await PDF.findOne({
-      _id: req.params.pdfId,
+    const chatHistories = await ChatHistory.find({
+      userId: req.userId
+    })
+    .populate('pdfId', 'filename originalName')
+    .sort({ lastActive: -1 })
+    .select('_id pdfId title lastActive createdAt messages');
+
+    res.json({
+      chatHistories: chatHistories.map(chat => ({
+        _id: chat._id,
+        pdfId: chat.pdfId?._id,
+        pdfName: chat.pdfId?.filename,
+        title: chat.title,
+        lastActive: chat.lastActive,
+        createdAt: chat.createdAt,
+        messageCount: chat.messages.length,
+        lastMessage: chat.messages.length > 0 ? chat.messages[chat.messages.length - 1].content.substring(0, 100) + '...' : ''
+      }))
+    });
+  } catch (error) {
+    console.error('Histories error:', error);
+    res.status(500).json({ error: 'Failed to fetch chat histories' });
+  }
+});
+
+// Delete a chat history
+router.delete('/history/:chatId', authMiddleware, async (req, res) => {
+  try {
+    const result = await ChatHistory.deleteOne({
+      _id: req.params.chatId,
       userId: req.userId
     });
 
-    if (!pdf) {
-      return res.status(404).json({ error: 'PDF not found' });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: 'Chat history not found' });
     }
 
-    res.json({
-      pdf: {
-        _id: pdf._id,
-        filename: pdf.filename,
-        textLength: pdf.textContent?.length || 0,
-        chunkCount: pdf.chunks?.length || 0,
-        firstChunk: pdf.chunks?.[0] || null,
-        sampleText: pdf.textContent?.substring(0, 500) || ''
-      }
+    res.json({ message: 'Chat history deleted successfully' });
+  } catch (error) {
+    console.error('Delete history error:', error);
+    res.status(500).json({ error: 'Failed to delete chat history' });
+  }
+});
+
+// Clear all chat histories for a PDF
+router.delete('/history/pdf/:pdfId', authMiddleware, async (req, res) => {
+  try {
+    const result = await ChatHistory.deleteMany({
+      pdfId: req.params.pdfId,
+      userId: req.userId
+    });
+
+    res.json({ 
+      message: 'All chat histories for PDF deleted successfully',
+      deletedCount: result.deletedCount
     });
   } catch (error) {
-    console.error('Debug error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Clear PDF history error:', error);
+    res.status(500).json({ error: 'Failed to clear chat histories' });
   }
 });
 
