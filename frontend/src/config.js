@@ -5,7 +5,7 @@ const config = {
   },
   // For production (Render)
   production: {
-    apiBaseUrl: 'https://rag-chatbot-lsru.onrender.com/api', // Your backend Render URL
+    apiBaseUrl: 'https://rag-chatbot-lsru.onrender.com/api', 
   }
 };
 
